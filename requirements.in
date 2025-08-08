@@ -1,0 +1,22 @@
+# Core LangChain and providers
+langchain
+langchain-core
+langchain-openai
+langchain-groq
+langchain-ollama
+
+# Web UI
+streamlit
+
+# Data processing
+pandas
+plotly
+
+# Visualization
+graphviz
+
+# Environment management
+python-dotenv
+
+# Build tooling
+uv
