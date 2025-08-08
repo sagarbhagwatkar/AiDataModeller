@@ -37,6 +37,74 @@ def _json_default(obj):
     return str(obj)
 
 
+def _normalize_er_for_ui(er: Any) -> Dict[str, Any]:
+    """Normalize ER spec so entities is always a dict with attributes list.
+    This guards the UI from agent variations (list or dict entities, etc.).
+    """
+    if not isinstance(er, dict):
+        return {"entities": {}, "relationships": []}
+
+    out: Dict[str, Any] = dict(er)
+    entities = out.get("entities", {})
+
+    def _attrs_to_list(attrs: Any) -> list[dict]:
+        if isinstance(attrs, list):
+            # Ensure each item has at least a name
+            result: list[dict] = []
+            for a in attrs:
+                if isinstance(a, dict):
+                    if "name" not in a:
+                        a = {"name": a.get("column", ""), **a}
+                    result.append(a)
+                else:
+                    result.append({"name": str(a)})
+            return result
+        if isinstance(attrs, dict):
+            return [
+                ({"name": k} | (v if isinstance(v, dict) else {}))
+                for k, v in attrs.items()
+            ]
+        return []
+
+    if isinstance(entities, list):
+        new_entities: Dict[str, Any] = {}
+        for i, e in enumerate(entities, 1):
+            if not isinstance(e, dict):
+                new_entities[f"entity_{i}"] = {
+                    "attributes": [],
+                    "row_count": 0,
+                }
+                continue
+            name = (
+                e.get("name")
+                or e.get("table")
+                or e.get("table_name")
+                or f"entity_{i}"
+            )
+            new_entities[name] = {
+                "attributes": _attrs_to_list(e.get("attributes", [])),
+                "row_count": int(e.get("row_count", 0) or 0),
+            }
+        out["entities"] = new_entities
+    elif isinstance(entities, dict):
+        for k, info in list(entities.items()):
+            if not isinstance(info, dict):
+                entities[k] = {"attributes": [], "row_count": 0}
+                continue
+            info["attributes"] = _attrs_to_list(info.get("attributes", []))
+            info["row_count"] = int(info.get("row_count", 0) or 0)
+        out["entities"] = entities
+    else:
+        out["entities"] = {}
+
+    # Ensure relationships is a list
+    rels = out.get("relationships", [])
+    if not isinstance(rels, list):
+        out["relationships"] = []
+
+    return out
+
+
 # Configure Streamlit page
 st.set_page_config(
     page_title="AI Data Modeller",
@@ -181,8 +249,9 @@ def display_analysis_results(results: Dict[str, Any]):
         
         # Show basic statistics
         if "er_diagram" in results and "entities" in results["er_diagram"]:
-            entities = results["er_diagram"]["entities"]
-            relationships = results["er_diagram"].get("relationships", [])
+            normalized = _normalize_er_for_ui(results["er_diagram"])
+            entities = normalized["entities"]
+            relationships = normalized.get("relationships", [])
             
             col1, col2, col3 = st.columns(3)
             with col1:
@@ -191,7 +260,7 @@ def display_analysis_results(results: Dict[str, Any]):
                 st.metric("Relationships Found", len(relationships))
             with col3:
                 total_attributes = sum(
-                    len(entity["attributes"]) for entity in entities.values()
+                    len(ent.get("attributes", [])) for ent in entities.values()
                 )
                 st.metric("Total Attributes", total_attributes)
     
@@ -213,6 +282,7 @@ def display_analysis_results(results: Dict[str, Any]):
         
         if "er_diagram" in results:
             er_data = results["er_diagram"]
+            er_data = _normalize_er_for_ui(er_data)
             
             # Display entities
             if "entities" in er_data:
@@ -232,17 +302,28 @@ def display_analysis_results(results: Dict[str, Any]):
                 st.write("**Relationships:**")
                 for rel in er_data["relationships"]:
                     st.write(
-                        f"• **{rel['parent_entity']}** → "
-                        f"**{rel['child_entity']}** "
-                        f"(via `{rel['foreign_key']}`)"
+                        f"• **{rel.get('parent_entity', '')}** → "
+                        f"**{rel.get('child_entity', '')}** "
+                        f"(via `{rel.get('foreign_key', '')}`)"
                     )
-            
-            # Download button for ER spec
+
+            # Visual ER diagram (Graphviz)
+            st.subheader("Visual ER Diagram")
+            dot = _er_spec_to_dot(er_data)
+            st.graphviz_chart(dot, use_container_width=True)
+
+            # Downloads
             st.download_button(
                 label="📥 Download ER Specification",
                 data=json.dumps(er_data, indent=2, default=_json_default),
                 file_name="er_diagram_spec.json",
                 mime="application/json"
+            )
+            st.download_button(
+                label="📥 Download ERD (DOT)",
+                data=dot,
+                file_name="erd.dot",
+                mime="text/vnd.graphviz"
             )
     
     with tab4:
@@ -265,6 +346,46 @@ def display_analysis_results(results: Dict[str, Any]):
                 "agent_output" in results["analysis"]):
             st.write("**Final Agent Output:**")
             st.text(results["analysis"]["agent_output"])
+
+
+def _er_spec_to_dot(er_data: Dict[str, Any]) -> str:
+    """Convert ER JSON spec to Graphviz DOT string (vertical layout)."""
+    entities = er_data.get("entities", {})
+    relationships = er_data.get("relationships", [])
+
+    lines: list[str] = [
+        "digraph ERD {",
+        "  rankdir=TB;",  # top-to-bottom (vertical)
+        '  node [shape=record, fontsize=12, fontname="Helvetica"];',
+        '  edge [color="#2563eb", penwidth=1.4];',
+    ]
+
+    # Nodes (tables)
+    for table, info in entities.items():
+        attrs = info.get("attributes", [])
+        # Build record-style label with PK marker
+        attr_lines = []
+        for attr in attrs:
+            name = attr.get("name", "")
+            is_pk = bool(attr.get("is_primary_key", False))
+            marker = " 🔑" if is_pk else ""
+            # Use left-justified line terminator \l
+            attr_lines.append(f"{name}{marker}\\l")
+        body = "".join(attr_lines)
+        label = f"{{{table}|{body}}}"
+        lines.append(f'  "{table}" [label="{label}"];')
+
+    # Edges (relationships)
+    for rel in relationships:
+        parent = rel.get("parent_entity")
+        child = rel.get("child_entity")
+        fk = rel.get("foreign_key", "")
+        lines.append(
+            f'  "{parent}" -> "{child}" [label="{fk}", arrowsize=0.8];'
+        )
+
+    lines.append("}")
+    return "\n".join(lines)
 
 
 def main():

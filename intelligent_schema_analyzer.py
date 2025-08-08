@@ -29,6 +29,7 @@ from tool import (
     find_composite_keys,
     find_dataframe_relations,
 )
+import re
 
 # Configure logging
 logging.basicConfig(
@@ -56,8 +57,9 @@ class IntelligentSchemaAnalyzer:
         provider: str = "groq",
         model_name: str = "llama3-8b-8192",
         api_key: Optional[str] = None,
-        max_iterations: int = 10,
-        verbose: bool = True
+        max_iterations: int = 25,
+        max_execution_time: Optional[int] = 120,
+        verbose: bool = True,
     ):
         """
         Initialize the Intelligent Schema Analyzer.
@@ -67,6 +69,7 @@ class IntelligentSchemaAnalyzer:
             model_name: Name of the model to use
             api_key: API key for the provider (if required)
             max_iterations: Maximum iterations for the agent
+            max_execution_time: Maximum execution time in seconds
             verbose: Whether to show detailed agent reasoning
         """
         self.provider = provider
@@ -78,9 +81,15 @@ class IntelligentSchemaAnalyzer:
         self.llm = self._create_llm(provider, model_name, api_key)
         
         # Initialize agent
-        self.agent_executor = self._create_agent(max_iterations, verbose)
+        self.agent_executor = self._create_agent(
+            max_iterations, max_execution_time, verbose
+        )
         
-        logger.info(f"Initialized IntelligentSchemaAnalyzer with {provider}/{model_name}")
+        logger.info(
+            "Initialized IntelligentSchemaAnalyzer with %s/%s",
+            provider,
+            model_name,
+        )
     
     def _create_llm(
         self, 
@@ -118,7 +127,12 @@ class IntelligentSchemaAnalyzer:
         else:
             raise ValueError(f"Unsupported provider: {provider}")
     
-    def _create_agent(self, max_iterations: int, verbose: bool) -> AgentExecutor:
+    def _create_agent(
+        self,
+        max_iterations: int,
+        max_execution_time: Optional[int],
+        verbose: bool,
+    ) -> AgentExecutor:
         """Create ReAct agent with data analysis tools."""
         
         # Create wrapper functions for tools
@@ -150,50 +164,100 @@ class IntelligentSchemaAnalyzer:
         tools = [
             Tool(
                 name="analyze_primary_keys",
-                description="Analyze potential primary key candidates in all loaded DataFrames. Returns detailed analysis of uniqueness, null values, and data types for each column.",
-                func=analyze_primary_keys_wrapper
+                description=(
+                    "Analyze potential primary key candidates in all "
+                    "loaded DataFrames. Returns detailed analysis of "
+                    "uniqueness, null values, and data types for each "
+                    "column."
+                ),
+                func=analyze_primary_keys_wrapper,
             ),
             Tool(
-                name="find_composite_keys", 
-                description="Find potential composite key combinations in all loaded DataFrames. Identifies columns that together could form a unique identifier.",
-                func=find_composite_keys_wrapper
+                name="find_composite_keys",
+                description=(
+                    "Find potential composite key combinations in all "
+                    "loaded DataFrames. Identifies columns that together "
+                    "could form a unique identifier."
+                ),
+                func=find_composite_keys_wrapper,
             ),
             Tool(
                 name="find_relationships",
-                description="Analyze relationships between DataFrames by finding foreign key connections. Identifies how tables relate to each other.",
-                func=find_relationships_wrapper
+                description=(
+                    "Analyze relationships between DataFrames by finding "
+                    "foreign key connections. Identifies how tables relate "
+                    "to each other."
+                ),
+                func=find_relationships_wrapper,
             ),
             Tool(
                 name="get_data_summary",
-                description="Get a summary of all loaded DataFrames including column names, data types, and basic statistics.",
-                func=self._get_data_summary
-            )
+                description=(
+                    "Get a summary of all loaded DataFrames including "
+                    "column names, data types, and basic statistics."
+                ),
+                func=self._get_data_summary,
+            ),
         ]
         
         # Create the ReAct prompt template
-        prompt = PromptTemplate.from_template("""
-You are an expert data analyst and database designer. Your job is to analyze data schemas and create comprehensive database designs.
-
-You have access to the following tools:
-{tools}
-
-Use the following format:
-
-Question: the input question you must answer
-Thought: you should always think about what you need to do
-Action: the action to take, should be one of [{tool_names}]
-Action Input: the input to the action (use empty string if no input needed)
-Observation: the result of the action
-... (this Thought/Action/Action Input/Observation can repeat N times)
-Thought: I now have enough information to provide a comprehensive analysis
-Final Answer: your final answer with detailed analysis
-
-Begin!
-
-Question: {input}
-Thought: I need to systematically analyze the data to understand its structure and relationships.
-{agent_scratchpad}
-""")
+        prompt_lines = [
+            "You are an expert data analyst and database designer.",
+            "Your job is to analyze data schemas and create",
+            "comprehensive database designs.",
+            "Aim to finish within 6 actions. If you have enough",
+            "information, provide the Final Answer immediately.",
+            "",
+            "You have access to the following tools:",
+            "{tools}",
+            "",
+            "Use the following format:",
+            "",
+            "Question: the input question you must answer",
+            "Thought: you should always think about what you need to do",
+            "Action: the action to take, should be one of [{tool_names}]",
+            "Action Input: the input to the action (use empty string if no",
+            "input needed)",
+            "Observation: the result of the action",
+            "... (this Thought/Action/Action",
+            "Input/Observation can repeat N times)",
+            "Thought: I now have enough information to provide a",
+            "comprehensive analysis",
+            "Final Answer: Provide outputs in this exact structure:",
+            "",
+            "<ANALYSIS_SUMMARY>",
+            "A concise summary of findings.",
+            "</ANALYSIS_SUMMARY>",
+            "",
+            "<SQL_DDL>",
+            "```sql",
+            "-- DDL starts here",
+            "-- One or more CREATE TABLE statements with constraints",
+            "-- Optional ALTER TABLE statements for FKs",
+            "```",
+            "</SQL_DDL>",
+            "",
+            "<ER_DIAGRAM_SPEC_JSON>",
+            "```json",
+            "Output a valid JSON object for the ER diagram specification.",
+            "It MUST include top-level keys: entities, relationships,",
+            "diagram_layout, title, and may include notes.",
+            "For each entity, include attributes (name, type,",
+            "is_primary_key, is_nullable, is_unique) and row_count.",
+            "For each relationship, include parent_entity, child_entity,",
+            "foreign_key, relationship_type, and cardinality.",
+            "Do not include comments in the JSON.",
+            "```",
+            "</ER_DIAGRAM_SPEC_JSON>",
+            "",
+            "Begin!",
+            "",
+            "Question: {input}",
+            "Thought: I need to systematically analyze the data",
+            "to understand its structure and relationships.",
+            "{agent_scratchpad}",
+        ]
+        prompt = PromptTemplate.from_template("\n".join(prompt_lines))
         
         # Create the ReAct agent
         agent = create_react_agent(self.llm, tools, prompt)
@@ -203,6 +267,7 @@ Thought: I need to systematically analyze the data to understand its structure a
             tools=tools,
             verbose=verbose,
             max_iterations=max_iterations,
+            max_execution_time=max_execution_time,
             handle_parsing_errors=True,
             return_intermediate_steps=True
         )
@@ -227,7 +292,11 @@ Sample Data: {df.head(2).to_dict('records')}
     def load_data(self, dataframes: Dict[str, pd.DataFrame]):
         """Load DataFrames for analysis."""
         self.dataframes = dataframes
-        logger.info(f"Loaded {len(dataframes)} DataFrames: {list(dataframes.keys())}")
+        logger.info(
+            "Loaded %d DataFrames: %s",
+            len(dataframes),
+            list(dataframes.keys()),
+        )
     
     def analyze_schema_with_agent(self) -> Dict[str, Any]:
         """
@@ -239,46 +308,224 @@ Sample Data: {df.head(2).to_dict('records')}
         if not self.dataframes:
             raise ValueError("No data loaded. Call load_data() first.")
         
-        logger.info("Starting comprehensive schema analysis with ReAct agent...")
+        logger.info("Starting schema analysis with ReAct agent...")
         
-        query = """
-        Please analyze the loaded data comprehensively by following these steps:
-
-        1. First, get a summary of all the data to understand what we're working with
-        2. Analyze primary key candidates for each table
-        3. Find any composite key opportunities
-        4. Identify relationships between tables
-        5. Based on your analysis, generate:
-           a) A comprehensive SQL DDL script with proper constraints, indexes, and foreign keys
-           b) A detailed ER diagram specification that shows all entities, attributes, and relationships
-
-        Provide a thorough analysis that demonstrates your understanding of the data structure and relationships.
-        """
+        query_lines = [
+            "Please analyze the loaded data comprehensively by",
+            "following these steps:",
+            "",
+            "1. First, get a summary of all the data to understand",
+            "what we're working with",
+            "2. Analyze primary key candidates for each table",
+            "3. Find any composite key opportunities",
+            "4. Identify relationships between tables",
+            "5. Based on your analysis, generate:",
+            "   a) A comprehensive SQL DDL script with proper",
+            "constraints, indexes, and foreign keys",
+            "   b) A detailed ER diagram specification that shows",
+            "all entities, attributes, and relationships",
+            "",
+            "Provide a thorough analysis that demonstrates your",
+            "understanding of the data structure and relationships.",
+        ]
+        query = "\n".join(query_lines)
         
         try:
             result = self.agent_executor.invoke({"input": query})
+            final_output = result.get("output", "") or ""
             
             # Store the analysis results
             self.analysis_results = {
-                "agent_output": result["output"],
+                "agent_output": final_output,
                 "intermediate_steps": result.get("intermediate_steps", []),
-                "reasoning_chain": self._extract_reasoning_chain(result)
+                "reasoning_chain": self._extract_reasoning_chain(result),
             }
             
-            # Generate structured outputs
-            ddl_script = self._generate_sql_ddl()
-            er_diagram_spec = self._generate_er_diagram_spec()
+            # Prefer agent-generated artifacts if available
+            ddl_from_agent, er_from_agent = self._parse_agent_outputs(
+                final_output
+            )
+            
+            # Fallbacks using tools if parsing failed
+            ddl_script = ddl_from_agent or self._generate_sql_ddl()
+            er_diagram_spec = er_from_agent or self._generate_er_diagram_spec()
+            
+            # Normalize ER spec shape for UI consumption
+            er_diagram_spec = self._normalize_er_spec(er_diagram_spec)
             
             return {
                 "analysis": self.analysis_results,
                 "sql_ddl": ddl_script,
                 "er_diagram": er_diagram_spec,
-                "summary": self._generate_analysis_summary()
+                "summary": self._generate_analysis_summary(),
             }
             
         except Exception as e:
             logger.error(f"Schema analysis failed: {e}")
             raise
+
+    def _parse_agent_outputs(
+        self, text: str
+    ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """Parse agent final output to extract SQL DDL and ER diagram JSON.
+        Returns (ddl_sql, er_spec_dict); either can be None if not found.
+        """
+        ddl_sql: Optional[str] = None
+        er_spec: Optional[Dict[str, Any]] = None
+
+        # Extract SQL
+        try:
+            m = re.search(r"```sql(.*?)```", text, re.IGNORECASE | re.DOTALL)
+            if m:
+                ddl_sql = m.group(1).strip()
+            else:
+                m2 = re.search(
+                    r"(CREATE\s+TABLE[\s\S]+)$", text, re.IGNORECASE
+                )
+                if m2:
+                    ddl_sql = m2.group(1).strip()
+        except Exception:
+            pass
+
+        # Extract ER JSON
+        try:
+            j = re.search(r"```json(.*?)```", text, re.IGNORECASE | re.DOTALL)
+            if j:
+                snippet = j.group(1).strip()
+                er_spec = json.loads(snippet)
+            else:
+                brace_start = text.find("{")
+                brace_end = text.rfind("}")
+                if (
+                    brace_start != -1 and brace_end != -1 and
+                    brace_end > brace_start
+                ):
+                    candidate = text[brace_start: brace_end + 1]
+                    try:
+                        er_spec = json.loads(candidate)
+                    except Exception:
+                        er_spec = None
+        except Exception:
+            er_spec = None
+
+        return ddl_sql, er_spec
+    
+    def _normalize_er_spec(self, er: Any) -> Dict[str, Any]:
+        """Ensure ER spec has a consistent shape.
+        - entities: dict[str, {attributes: list[dict], row_count: int}]
+        - relationships: list[dict]
+        """
+        if not isinstance(er, dict):
+            return {"entities": {}, "relationships": []}
+        
+        out: Dict[str, Any] = dict(er)
+        entities = out.get("entities", {})
+
+        def _normalize_attrs(attrs: Any) -> List[Dict[str, Any]]:
+            res: List[Dict[str, Any]] = []
+            if isinstance(attrs, dict):
+                for k, v in attrs.items():
+                    if isinstance(v, dict):
+                        item = {"name": k, **v}
+                    else:
+                        item = {"name": k, "type": str(v)}
+                    item.setdefault("is_primary_key", False)
+                    item.setdefault("is_nullable", True)
+                    item.setdefault("is_unique", False)
+                    res.append(item)
+            elif isinstance(attrs, list):
+                for a in attrs:
+                    if isinstance(a, dict):
+                        a.setdefault("name", a.get("column", ""))
+                        a.setdefault("type", a.get("dtype", "TEXT"))
+                        a.setdefault("is_primary_key", False)
+                        a.setdefault("is_nullable", True)
+                        a.setdefault("is_unique", False)
+                        res.append(a)
+                    else:
+                        res.append({
+                            "name": str(a),
+                            "type": "TEXT",
+                            "is_primary_key": False,
+                            "is_nullable": True,
+                            "is_unique": False,
+                        })
+            else:
+                # Unknown, return empty
+                pass
+            return res
+
+        # Normalize entities to dict
+        if isinstance(entities, list):
+            new_entities: Dict[str, Any] = {}
+            for i, e in enumerate(entities):
+                if not isinstance(e, dict):
+                    name = f"entity_{i+1}"
+                    new_entities[name] = {"attributes": [], "row_count": 0}
+                    continue
+                name = (
+                    e.get("name")
+                    or e.get("entity")
+                    or e.get("table")
+                    or e.get("table_name")
+                    or f"entity_{i+1}"
+                )
+                attrs = _normalize_attrs(e.get("attributes", []))
+                row_count = int(e.get("row_count", 0) or 0)
+                new_entities[name] = {
+                    "attributes": attrs,
+                    "row_count": row_count,
+                }
+            out["entities"] = new_entities
+        elif isinstance(entities, dict):
+            for k, info in list(entities.items()):
+                if not isinstance(info, dict):
+                    entities[k] = {"attributes": [], "row_count": 0}
+                    continue
+                attrs = _normalize_attrs(info.get("attributes", []))
+                info["attributes"] = attrs
+                info["row_count"] = int(info.get("row_count", 0) or 0)
+            out["entities"] = entities
+        else:
+            out["entities"] = {}
+
+        # Normalize relationships to list of dicts
+        rels = out.get("relationships", [])
+        norm_rels: List[Dict[str, Any]] = []
+        if isinstance(rels, dict):
+            # Possibly keyed by "parent-child" or similar
+            for key, rel_list in rels.items():
+                if isinstance(rel_list, list):
+                    for item in rel_list:
+                        if isinstance(item, dict):
+                            parent, child = None, None
+                            if isinstance(key, str) and "-" in key:
+                                parent, child = key.split("-", 1)
+                            norm_rels.append({
+                                "parent_entity": item.get("parent_entity", parent),
+                                "child_entity": item.get("child_entity", child),
+                                "foreign_key": item.get("column")
+                                or item.get("foreign_key", ""),
+                                "relationship_type": item.get(
+                                    "relationship_type", "one-to-many"
+                                ),
+                                "cardinality": item.get("cardinality", "unknown"),
+                            })
+        elif isinstance(rels, list):
+            for item in rels:
+                if isinstance(item, dict):
+                    norm_rels.append({
+                        "parent_entity": item.get("parent_entity"),
+                        "child_entity": item.get("child_entity"),
+                        "foreign_key": item.get("foreign_key", ""),
+                        "relationship_type": item.get(
+                            "relationship_type", "one-to-many"
+                        ),
+                        "cardinality": item.get("cardinality", "unknown"),
+                    })
+        out["relationships"] = norm_rels
+
+        return out
     
     def _extract_reasoning_chain(self, result: Dict) -> List[Dict]:
         """Extract the agent's reasoning chain from the result."""
@@ -288,8 +535,15 @@ Sample Data: {df.head(2).to_dict('records')}
                 if len(step) >= 2:
                     action, observation = step[0], step[1]
                     chain.append({
-                        "action": action.tool if hasattr(action, 'tool') else str(action),
-                        "observation": str(observation)[:500] + "..." if len(str(observation)) > 500 else str(observation)
+                        "action": (
+                            action.tool if hasattr(action, 'tool')
+                            else str(action)
+                        ),
+                        "observation": (
+                            str(observation)[:500] + "..."
+                            if len(str(observation)) > 500
+                            else str(observation)
+                        ),
                     })
         return chain
     
@@ -319,7 +573,10 @@ Sample Data: {df.head(2).to_dict('records')}
                     
                     # Check if this is a primary key candidate
                     pk_info = primary_keys.get(table_name, {}).get(col, {})
-                    is_pk = pk_info.get('is_unique', False) and not pk_info.get('has_nulls', True)
+                    is_pk = (
+                        pk_info.get('is_unique', False)
+                        and not pk_info.get('has_nulls', True)
+                    )
                     
                     constraint = ""
                     if is_pk:
@@ -340,8 +597,12 @@ Sample Data: {df.head(2).to_dict('records')}
                     for relation in relations_list:
                         column = relation['column']
                         ddl_parts.append(
-                            f"ALTER TABLE {child_table} ADD CONSTRAINT fk_{child_table}_{column} "
-                            f"FOREIGN KEY ({column}) REFERENCES {parent_table}({column});"
+                            (
+                                f"ALTER TABLE {child_table} ADD CONSTRAINT "
+                                f"fk_{child_table}_{column} "
+                                f"FOREIGN KEY ({column}) REFERENCES "
+                                f"{parent_table}({column});"
+                            )
                         )
             
             # Add indexes for performance
@@ -350,7 +611,12 @@ Sample Data: {df.head(2).to_dict('records')}
                 if self.dataframes[table_name] is not None:
                     for col in self.dataframes[table_name].columns:
                         if col.endswith('_id') or 'id' in col.lower():
-                            ddl_parts.append(f"CREATE INDEX idx_{table_name}_{col} ON {table_name}({col});")
+                            ddl_parts.append(
+                                (
+                                    f"CREATE INDEX idx_{table_name}_{col} "
+                                    f"ON {table_name}({col});"
+                                )
+                            )
             
             return "\n".join(ddl_parts)
             
@@ -424,7 +690,9 @@ Sample Data: {df.head(2).to_dict('records')}
                             'child_entity': child_table,
                             'foreign_key': relation['column'],
                             'relationship_type': 'one-to-many',
-                            'cardinality': relation.get('cardinality', 'unknown')
+                            'cardinality': relation.get(
+                                'cardinality', 'unknown'
+                            ),
                         })
             
             return {
@@ -432,7 +700,10 @@ Sample Data: {df.head(2).to_dict('records')}
                 'relationships': relationships_spec,
                 'diagram_layout': 'vertical',
                 'title': 'Database Entity-Relationship Diagram',
-                'notes': 'Generated by Intelligent Schema Analyzer using ReAct Agent'
+                'notes': (
+                    'Generated by Intelligent Schema Analyzer using '
+                    'ReAct Agent'
+                ),
             }
             
         except Exception as e:
@@ -448,14 +719,26 @@ Sample Data: {df.head(2).to_dict('records')}
             summary.append(f"📊 Analyzed {len(self.dataframes)} tables:")
             for name, df in self.dataframes.items():
                 if df is not None:
-                    summary.append(f"  • {name}: {len(df)} rows, {len(df.columns)} columns")
+                    summary.append(
+                        (
+                            f"  • {name}: {len(df)} rows, "
+                            f"{len(df.columns)} columns"
+                        )
+                    )
             summary.append("")
         
         # Add reasoning chain if available
-        if hasattr(self, 'analysis_results') and 'reasoning_chain' in self.analysis_results:
+        if (
+            hasattr(self, 'analysis_results')
+            and 'reasoning_chain' in self.analysis_results
+        ):
             summary.append("🧠 Agent Reasoning Process:")
-            for i, step in enumerate(self.analysis_results['reasoning_chain'], 1):
-                summary.append(f"  {i}. Used tool '{step['action']}'")
+            for i, step in enumerate(
+                self.analysis_results['reasoning_chain'], 1
+            ):
+                summary.append(
+                    f"  {i}. Used tool '{step['action']}'"
+                )
             summary.append("")
         
         summary.append("✅ Generated comprehensive SQL DDL script")
@@ -548,7 +831,7 @@ def get_user_provider_choice() -> tuple:
     """Get user's choice of LLM provider and model."""
     print("\n🤖 Choose your LLM Provider:")
     print("1. GROQ (Fast, requires API key)")
-    print("2. OpenAI (High quality, requires API key)")  
+    print("2. OpenAI (High quality, requires API key)")
     print("3. Ollama (Local, no API key needed)")
     print("4. Use default (GROQ)")
     
