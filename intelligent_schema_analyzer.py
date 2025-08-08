@@ -379,11 +379,25 @@ Sample Data: {df.head(2).to_dict('records')}
             if m:
                 ddl_sql = m.group(1).strip()
             else:
-                m2 = re.search(
-                    r"(CREATE\s+TABLE[\s\S]+)$", text, re.IGNORECASE
-                )
+                # Heuristic: capture from first CREATE TABLE to before
+                # ER JSON or the next fenced block
+                m2 = re.search(r"CREATE\s+TABLE[\s\S]+", text, re.IGNORECASE)
                 if m2:
-                    ddl_sql = m2.group(1).strip()
+                    start = m2.start()
+                    stop_markers = [
+                        "\n```",  # next fenced block
+                        "\n<ER_DIAGRAM_SPEC_JSON>",
+                        "\n```json",
+                        "\n</SQL_DDL>",
+                        "\n<ER_",
+                    ]
+                    ends = [text.find(mk, start + 1) for mk in stop_markers]
+                    ends = [p for p in ends if p != -1]
+                    end = min(ends) if ends else len(text)
+                    ddl_sql = text[start:end].strip()
+                    # Remove any accidental trailing fence start
+                    if "\n```" in ddl_sql:
+                        ddl_sql = ddl_sql.split("\n```", 1)[0].strip()
         except Exception:
             pass
 
@@ -502,14 +516,20 @@ Sample Data: {df.head(2).to_dict('records')}
                             if isinstance(key, str) and "-" in key:
                                 parent, child = key.split("-", 1)
                             norm_rels.append({
-                                "parent_entity": item.get("parent_entity", parent),
-                                "child_entity": item.get("child_entity", child),
+                                "parent_entity": item.get(
+                                    "parent_entity", parent
+                                ),
+                                "child_entity": item.get(
+                                    "child_entity", child
+                                ),
                                 "foreign_key": item.get("column")
                                 or item.get("foreign_key", ""),
                                 "relationship_type": item.get(
                                     "relationship_type", "one-to-many"
                                 ),
-                                "cardinality": item.get("cardinality", "unknown"),
+                                "cardinality": item.get(
+                                    "cardinality", "unknown"
+                                ),
                             })
         elif isinstance(rels, list):
             for item in rels:
