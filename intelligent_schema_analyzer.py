@@ -199,6 +199,8 @@ class IntelligentSchemaAnalyzer:
                 func=self._get_data_summary,
             ),
         ]
+
+        tool_names = ["analyze_primary_keys", "find_composite_keys", "find_relationships", "get_data_summary"]
         
         # Create the ReAct prompt template
         prompt_lines = [
@@ -609,21 +611,35 @@ Sample Data: {df.head(2).to_dict('records')}
                 ddl_parts.append(",\n".join(columns))
                 ddl_parts.append(");\n")
             
-            # Add foreign key constraints
+            # Add foreign key constraints (supports tuple or string keys, JSON parent/child pattern)
             ddl_parts.append("-- Foreign Key Constraints")
             for rel_key, relations_list in relationships.items():
-                if isinstance(rel_key, str) and '-' in rel_key:
+                if isinstance(rel_key, tuple) and len(rel_key) == 2:
+                    parent_table, child_table = rel_key
+                elif isinstance(rel_key, str) and '-' in rel_key:
                     parent_table, child_table = rel_key.split('-', 1)
-                    for relation in relations_list:
-                        column = relation['column']
-                        ddl_parts.append(
-                            (
-                                f"ALTER TABLE {child_table} ADD CONSTRAINT "
-                                f"fk_{child_table}_{column} "
-                                f"FOREIGN KEY ({column}) REFERENCES "
-                                f"{parent_table}({column});"
-                            )
+                else:
+                    continue
+                for relation in relations_list:
+                    child_col = relation.get('child_column') or relation.get('column')
+                    parent_col = relation.get('parent_column') or relation.get('column')
+                    if not child_col or not parent_col:
+                        continue
+                    # Only create FK if columns exist in respective tables
+                    child_df = self.dataframes.get(child_table)
+                    parent_df = self.dataframes.get(parent_table)
+                    if (child_df is None or parent_df is None or
+                            child_col not in child_df.columns or
+                            parent_col not in parent_df.columns):
+                        continue
+                    ddl_parts.append(
+                        (
+                            f"ALTER TABLE {child_table} ADD CONSTRAINT "
+                            f"fk_{child_table}_{child_col} "
+                            f"FOREIGN KEY ({child_col}) REFERENCES "
+                            f"{parent_table}({parent_col});"
                         )
+                    )
             
             # Add indexes for performance
             ddl_parts.append("\n-- Performance Indexes")
@@ -702,18 +718,21 @@ Sample Data: {df.head(2).to_dict('records')}
             # Build relationships
             relationships_spec = []
             for rel_key, relations_list in relationships.items():
-                if isinstance(rel_key, str) and '-' in rel_key:
+                if isinstance(rel_key, tuple) and len(rel_key) == 2:
+                    parent_table, child_table = rel_key
+                elif isinstance(rel_key, str) and '-' in rel_key:
                     parent_table, child_table = rel_key.split('-', 1)
-                    for relation in relations_list:
-                        relationships_spec.append({
-                            'parent_entity': parent_table,
-                            'child_entity': child_table,
-                            'foreign_key': relation['column'],
-                            'relationship_type': 'one-to-many',
-                            'cardinality': relation.get(
-                                'cardinality', 'unknown'
-                            ),
-                        })
+                else:
+                    continue
+                for relation in relations_list:
+                    fk_child = relation.get('child_column') or relation.get('column')
+                    relationships_spec.append({
+                        'parent_entity': parent_table,
+                        'child_entity': child_table,
+                        'foreign_key': fk_child,
+                        'relationship_type': relation.get('relationship_type', 'one-to-many'),
+                        'cardinality': relation.get('cardinality', 'unknown'),
+                    })
             
             return {
                 'entities': entities,

@@ -16,6 +16,11 @@ from typing import Dict, Any, Optional
 import traceback
 
 from intelligent_schema_analyzer import IntelligentSchemaAnalyzer
+from tool import csvs_jsons_to_dataframes  # Abbreviation/vector store features removed
+try:  # Optional import; UI should still work without DB libs
+    import psycopg2  # type: ignore
+except Exception:  # noqa: BLE001
+    psycopg2 = None  # type: ignore
 
 
 # Helper to JSON-serialize numpy/pandas types
@@ -122,48 +127,39 @@ def init_session_state():
         st.session_state.analysis_results = None
     if 'analyzer' not in st.session_state:
         st.session_state.analyzer = None
+    if 'db_config' not in st.session_state:
+        st.session_state.db_config = {
+            'host': 'localhost',
+            'port': 5432,
+            'dbname': 'mypoc',
+            'user': 'sagarbhagwatkar',
+            'password': ''
+        }
+    if 'db_status' not in st.session_state:
+        st.session_state.db_status = None
+    if 'db_tables' not in st.session_state:
+        st.session_state.db_tables = []
+    if 'db_selected_tables' not in st.session_state:
+        st.session_state.db_selected_tables = []
+    if 'db_row_limit' not in st.session_state:
+        st.session_state.db_row_limit = 10000
 
 
 def load_sample_data():
-    """Load sample e-commerce data for demo."""
+    """Return small in-memory demo dataset."""
     return {
         'customers': pd.DataFrame({
             'customer_id': [1, 2, 3, 4, 5],
-            'name': [
-                'Alice Johnson', 'Bob Smith', 'Charlie Brown',
-                'Diana Prince', 'Eve Wilson'
-            ],
-            'email': [
-                'alice@email.com', 'bob@email.com', 'charlie@email.com',
-                'diana@email.com', 'eve@email.com'
-            ],
-            'registration_date': pd.to_datetime([
-                '2024-01-15', '2024-01-16', '2024-01-17',
-                '2024-01-18', '2024-01-19'
-            ])
+            'name': ['Alice Johnson', 'Bob Smith', 'Charlie Brown', 'Diana Prince', 'Eve Wilson'],
+            'email': ['alice@email.com', 'bob@email.com', 'charlie@email.com', 'diana@email.com', 'eve@email.com'],
+            'registration_date': pd.to_datetime(['2024-01-15','2024-01-16','2024-01-17','2024-01-18','2024-01-19'])
         }),
         'orders': pd.DataFrame({
-            'order_id': [101, 102, 103, 104, 105, 106],
-            'customer_id': [1, 1, 2, 3, 4, 5],
-            'order_date': pd.to_datetime([
-                '2024-01-15', '2024-01-16', '2024-01-17',
-                '2024-01-18', '2024-01-19', '2024-01-20'
-            ]),
-            'total_amount': [150.99, 75.50, 200.00, 120.25, 89.99, 300.00],
-            'status': [
-                'completed', 'completed', 'pending',
-                'shipped', 'completed', 'processing'
-            ]
-        }),
-        'products': pd.DataFrame({
-            'product_id': [201, 202, 203, 204, 205],
-            'name': ['Laptop', 'Mouse', 'Keyboard', 'Monitor', 'Headphones'],
-            'category': [
-                'Electronics', 'Accessories', 'Accessories',
-                'Electronics', 'Electronics'
-            ],
-            'price': [999.99, 29.99, 79.99, 299.99, 149.99],
-            'stock_quantity': [50, 100, 75, 25, 60]
+            'order_id': [101,102,103,104,105,106],
+            'customer_id': [1,1,2,3,4,5],
+            'order_date': pd.to_datetime(['2024-01-15','2024-01-16','2024-01-17','2024-01-18','2024-01-19','2024-01-20']),
+            'total_amount': [150.99,75.50,200.00,120.25,89.99,300.00],
+            'status': ['completed','completed','pending','shipped','completed','processing']
         })
     }
 
@@ -206,7 +202,7 @@ def create_analyzer(provider: str, model_name: str,
 def run_analysis():
     """Run the schema analysis."""
     if not st.session_state.dataframes:
-        st.error("No data loaded. Please upload CSV files first.")
+        st.error("No data loaded. Please upload CSV or JSON files first.")
         return
     
     if not st.session_state.analyzer:
@@ -396,9 +392,10 @@ def main():
     st.title("🧠 AI Data Modeller")
     st.markdown("**Intelligent Schema Analysis with ReAct Agent**")
     st.markdown(
-        "Upload your CSV files and generate comprehensive database schemas "
-        "with SQL DDL and ER diagrams."
+        "Upload CSV and/or JSON files (nested JSON supported). Nested list-of-object structures become separate tables; the analyzer will generate SQL DDL and ER diagrams."
     )
+
+    # Vector store / abbreviation functionality removed per user request.
     
     # Sidebar for configuration
     with st.sidebar:
@@ -412,31 +409,35 @@ def main():
             st.session_state.dataframes = load_sample_data()
             st.success("Sample data loaded!")
         
-        # File uploader
+        # File uploader (CSV + JSON + Excel)
         uploaded_files = st.file_uploader(
-            "Upload CSV Files",
-            type=['csv'],
+            "Upload CSV, JSON, or Excel files",
+            type=["csv", "json", "xlsx", "xls"],
             accept_multiple_files=True,
-            help="Upload one or more CSV files for analysis"
+            help=(
+                "Upload CSV, JSON (nested supported), or Excel workbooks. "
+                "Nested JSON lists of objects become separate tables; each Excel sheet becomes a table."
+            )
         )
-        
+
         if uploaded_files:
-            dataframes = {}
-            for uploaded_file in uploaded_files:
-                try:
-                    df = pd.read_csv(uploaded_file)
-                    table_name = uploaded_file.name.replace('.csv', '')
-                    dataframes[table_name] = df
-                    st.success(f"✅ Loaded: {table_name} ({len(df)} rows)")
-                except Exception as e:
-                    st.error(
-                        f"❌ Failed to load {uploaded_file.name}: {str(e)}"
-                    )
-            
-            if dataframes:
-                st.session_state.dataframes = dataframes
+            try:
+                loaded = csvs_jsons_to_dataframes(uploaded_files)
+                loaded = {k: v for k, v in loaded.items() if v is not None}
+                if not loaded:
+                    st.error("All uploaded files failed to load.")
+                else:
+                    st.session_state.dataframes = loaded
+                    for name, df in loaded.items():
+                        st.success(f"✅ Loaded: {name} ({len(df)} rows, {len(df.columns)} cols)")
+                    nested_tables = [n for n in loaded if '__' in n]
+                    if nested_tables:
+                        st.info("Nested JSON produced tables: " + ", ".join(nested_tables))
+            except Exception as e:  # noqa: BLE001
+                st.error(f"Failed to process uploaded files: {e}")
         
         st.divider()
+
         
         # LLM Configuration
         st.subheader("🤖 LLM Configuration")
@@ -471,7 +472,6 @@ def main():
                     "gpt-3.5-turbo",
                     "gpt-4",
                     "gpt-4-turbo",
-                    "gpt-5-preview",
                 ],
             )
             api_key = st.text_input(
@@ -483,7 +483,7 @@ def main():
         
         else:  # ollama
             model_name = st.selectbox(
-                "Model", ["llama3", "codellama", "phi3", "mistral"]
+                "Model", ["llama3", "qwen3:14b", "gpt-oss:20b", "deepseek-r1:8b"]
             )
             api_key = None
         
@@ -496,6 +496,111 @@ def main():
                 )
         
         st.divider()
+
+        # Database Configuration
+        st.subheader("🗄️ Database Connection")
+        st.caption("Configure PostgreSQL connection (optional)")
+        with st.expander("Configure Database", expanded=False):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                host = st.text_input("Host", value=st.session_state.db_config['host'])
+                dbname = st.text_input("Database", value=st.session_state.db_config['dbname'])
+                user = st.text_input("User", value=st.session_state.db_config['user'])
+            with col_b:
+                port = st.number_input("Port", value=int(st.session_state.db_config['port']), step=1)
+                password = st.text_input("Password", value=st.session_state.db_config['password'], type="password")
+                fetch_button = st.button("🔌 Test Connection & List Tables", use_container_width=True)
+
+            # Update session state with latest entered values
+            st.session_state.db_config.update({
+                'host': host,
+                'port': int(port),
+                'dbname': dbname,
+                'user': user,
+                'password': password,
+            })
+
+            if fetch_button:
+                if psycopg2 is None:
+                    st.error("psycopg2 not installed. Install dependencies to enable DB connectivity.")
+                else:
+                    cfg = st.session_state.db_config
+                    try:
+                        with st.spinner("Connecting to database..."):
+                            conn = psycopg2.connect(
+                                host=cfg['host'],
+                                port=cfg['port'],
+                                dbname=cfg['dbname'],
+                                user=cfg['user'],
+                                password=cfg['password'] or None,
+                            )
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """
+                                    SELECT table_schema, table_name
+                                    FROM information_schema.tables
+                                    WHERE table_schema NOT IN ('pg_catalog','information_schema')
+                                    ORDER BY table_schema, table_name
+                                    """
+                                )
+                                rows = cur.fetchall()
+                            conn.close()
+                        st.session_state.db_tables = rows
+                        st.session_state.db_status = "success"
+                        st.success(f"Connected. Found {len(rows)} tables.")
+                    except Exception as e:  # noqa: BLE001
+                        st.session_state.db_status = "error"
+                        st.session_state.db_tables = []
+                        st.error(f"Connection failed: {e}")
+        # Show tables if available
+        if st.session_state.db_tables:
+            with st.expander("📋 Database Tables (Current Session)", expanded=False):
+                # Selection controls
+                all_table_labels = [f"{schema}.{table}" for schema, table in st.session_state.db_tables]
+                select_all = st.checkbox("Select All Tables", value=False, key="db_select_all")
+                if select_all:
+                    current_selection = all_table_labels
+                else:
+                    current_selection = st.multiselect(
+                        "Choose tables to load", all_table_labels,
+                        default=st.session_state.db_selected_tables
+                    )
+                st.session_state.db_selected_tables = current_selection
+                st.session_state.db_row_limit = st.number_input(
+                    "Row Limit (0 = all)", min_value=0, value=int(st.session_state.db_row_limit), step=1000
+                )
+                load_btn = st.button("⬇️ Load Selected Tables", use_container_width=True)
+
+                if load_btn and current_selection:
+                    if psycopg2 is None:
+                        st.error("psycopg2 not installed.")
+                    else:
+                        loaded = {}
+                        cfg = st.session_state.db_config
+                        row_limit = int(st.session_state.db_row_limit)
+                        try:
+                            with st.spinner("Loading tables from database..."):
+                                conn = psycopg2.connect(
+                                    host=cfg['host'], port=cfg['port'], dbname=cfg['dbname'],
+                                    user=cfg['user'], password=cfg['password'] or None,
+                                )
+                                for label in current_selection:
+                                    schema, table = label.split('.', 1)
+                                    sql = f'SELECT * FROM "{schema}"."{table}"'
+                                    if row_limit > 0:
+                                        sql += f" LIMIT {row_limit}"
+                                    df = pd.read_sql(sql, conn)  # type: ignore
+                                    # Key naming: if schema != public, prefix schema
+                                    key = table if schema == 'public' else f"{schema}_{table}"
+                                    loaded[key] = df
+                                conn.close()
+                            # Merge with existing dataframes (overwrite duplicates)
+                            st.session_state.dataframes.update(loaded)
+                            st.success(f"Loaded {len(loaded)} tables into workspace.")
+                        except Exception as e:  # noqa: BLE001
+                            st.error(f"Failed loading tables: {e}")
+                elif load_btn and not current_selection:
+                    st.warning("No tables selected.")
         
         # Analysis controls
         st.subheader("🔍 Analysis")
@@ -531,7 +636,7 @@ def main():
         👋 **Welcome to AI Data Modeller!**
         
         To get started:
-        1. **Upload CSV files** using the sidebar file uploader, or click
+    1. **Upload CSV or JSON files** using the sidebar file uploader, or click
            "Use Sample Data"
         2. **Configure your LLM provider** (GROQ, OpenAI, or Ollama)
         3. **Initialize the analyzer** with your chosen settings
