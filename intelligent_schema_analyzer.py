@@ -28,6 +28,7 @@ from tool import (
     analyze_primary_key_candidates,
     find_composite_keys,
     find_dataframe_relations,
+    abbreviate_columns,
 )
 import re
 
@@ -76,15 +77,17 @@ class IntelligentSchemaAnalyzer:
         self.model_name = model_name
         self.dataframes: Dict[str, pd.DataFrame] = {}
         self.analysis_results = {}
-        
+        # Mapping: table -> {original_column: abbreviated_column}
+        self.abbrev_map: Dict[str, Dict[str, str]] = {}
+
         # Initialize LLM
         self.llm = self._create_llm(provider, model_name, api_key)
-        
+
         # Initialize agent
         self.agent_executor = self._create_agent(
             max_iterations, max_execution_time, verbose
         )
-        
+
         logger.info(
             "Initialized IntelligentSchemaAnalyzer with %s/%s",
             provider,
@@ -159,6 +162,40 @@ class IntelligentSchemaAnalyzer:
                 return str(result)
             except Exception as e:
                 return f"Error finding relationships: {str(e)}"
+
+        def abbreviate_columns_wrapper(input_str: str = "") -> str:
+            """Generate abbreviated column names per table and store in analyzer.
+
+            Optional JSON input example:
+              {"custom_rules": {"description": "desc"}, "max_token_length": 10, "tables": ["orders"]}
+            Returns JSON: {table: {original: abbreviated}}
+            """
+            try:
+                custom_rules = None
+                max_token_length = 12
+                table_filter = None
+                if input_str:
+                    try:
+                        payload = json.loads(input_str)
+                        custom_rules = payload.get("custom_rules")
+                        max_token_length = payload.get("max_token_length", 12)
+                        if payload.get("tables"):
+                            table_filter = set(payload["tables"])  # type: ignore[arg-type]
+                    except Exception:
+                        pass
+                mapping: Dict[str, Dict[str, str]] = {}
+                for tname, df in self.dataframes.items():
+                    if df is None:
+                        continue
+                    if table_filter and tname not in table_filter:
+                        continue
+                    mapping[tname] = abbreviate_columns(df.columns, custom_rules=custom_rules, max_token_length=max_token_length)
+                # Persist mapping
+                for t, m in mapping.items():
+                    self.abbrev_map.setdefault(t, {}).update(m)
+                return json.dumps(mapping)
+            except Exception as e:  # noqa: BLE001
+                return f"Error abbreviating columns: {e}"
         
         # Create tool instances that work with the stored dataframes
         tools = [
@@ -171,6 +208,15 @@ class IntelligentSchemaAnalyzer:
                     "column."
                 ),
                 func=analyze_primary_keys_wrapper,
+            ),
+            Tool(
+                name="abbreviate_columns",
+                description=(
+                    "Create standardized short forms for column names across tables. "
+                    "Call this early; subsequent outputs should use the abbreviated names. "
+                    "Optional JSON input with custom_rules, max_token_length, tables."
+                ),
+                func=abbreviate_columns_wrapper,
             ),
             Tool(
                 name="find_composite_keys",
@@ -199,14 +245,27 @@ class IntelligentSchemaAnalyzer:
                 func=self._get_data_summary,
             ),
         ]
+        tool_names = [
+            "analyze_primary_keys",
+            "abbreviate_columns",
+            "find_composite_keys",
+            "find_relationships",
+            "get_data_summary",
+        ]
 
-        tool_names = ["analyze_primary_keys", "find_composite_keys", "find_relationships", "get_data_summary"]
-        
         # Create the ReAct prompt template
         prompt_lines = [
             "You are an expert data analyst and database designer.",
-            "Your job is to analyze data schemas and create",
-            "comprehensive database designs.",
+            "Your job is to analyze data schemas (CSV/JSON/Excel) and create comprehensive database designs.",
+            (
+                "First call abbreviate_columns to establish shortened column names; then normalize them to lowercase snake_case and "
+                "apply logical semantic suffixes BEFORE generating any DDL or ER output:"
+            ),
+            "  • Phone / Telephone / Mobile columns: ensure suffix _no (e.g. Phone -> ph_no, mobile_number -> mob_no)",
+            "  • Name / descriptive identity columns: ensure suffix _nm (e.g. Country -> cntry_nm, CustomerName -> cust_nm)",
+            "  • If abbreviation already ends with the suffix, don't duplicate it.",
+            "  • Only add a suffix when it adds clarity (avoid for pure IDs, numeric metrics, dates).",
+            "After suffix adjustment use ONLY the final names in all outputs (SQL DDL, foreign keys, ER spec).",
             "Aim to finish within 6 actions. If you have enough",
             "information, provide the Final Answer immediately.",
             "",
@@ -228,7 +287,7 @@ class IntelligentSchemaAnalyzer:
             "Final Answer: Provide outputs in this exact structure:",
             "",
             "<ANALYSIS_SUMMARY>",
-            "A concise summary of findings.",
+            "A concise summary of findings (note that abbreviated column names were applied).",
             "</ANALYSIS_SUMMARY>",
             "",
             "<SQL_DDL>",
@@ -309,6 +368,18 @@ Sample Data: {df.head(2).to_dict('records')}
         """
         if not self.dataframes:
             raise ValueError("No data loaded. Call load_data() first.")
+
+        # Auto-abbreviate if mapping empty so suffix rules take effect even if agent forgets tool
+        if not self.abbrev_map:
+            try:
+                from tool import abbreviate_columns  # local import to avoid circulars
+                for t, df in self.dataframes.items():
+                    if df is None:
+                        continue
+                    self.abbrev_map[t] = abbreviate_columns(df.columns)
+                logger.info("Auto-generated abbreviations for %d tables (fallback)", len(self.abbrev_map))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Auto abbreviation failed: %s", e)
         
         logger.info("Starting schema analysis with ReAct agent...")
         
@@ -351,6 +422,42 @@ Sample Data: {df.head(2).to_dict('records')}
             # Fallbacks using tools if parsing failed
             ddl_script = ddl_from_agent or self._generate_sql_ddl()
             er_diagram_spec = er_from_agent or self._generate_er_diagram_spec()
+
+            # If agent provided DDL but it still contains obvious original names while abbrev_map exists, regenerate
+            if ddl_from_agent and self.abbrev_map:
+                any_orig = False
+                for t, mapping in self.abbrev_map.items():
+                    for orig, abbr in mapping.items():
+                        if orig != abbr and orig in ddl_from_agent and abbr not in ddl_from_agent:
+                            any_orig = True
+                            break
+                    if any_orig:
+                        break
+                if any_orig:
+                    logger.info("Regenerating DDL with abbreviations (agent output not abbreviated)")
+                    ddl_script = self._generate_sql_ddl()
+
+            # Similarly adjust ER spec
+            if er_from_agent and self.abbrev_map and isinstance(er_from_agent, dict):
+                # naive scan: if any entity attribute uses original but not abbreviated
+                needs_regen = False
+                try:
+                    entities = er_from_agent.get('entities', {})
+                    for t, mapping in self.abbrev_map.items():
+                        ent = entities.get(t) or {}
+                        attrs = ent.get('attributes') or []
+                        attr_names = {a.get('name') for a in attrs if isinstance(a, dict)}
+                        for orig, abbr in mapping.items():
+                            if orig != abbr and orig in attr_names and abbr not in attr_names:
+                                needs_regen = True
+                                break
+                        if needs_regen:
+                            break
+                except Exception:
+                    needs_regen = True
+                if needs_regen:
+                    logger.info("Regenerating ER spec with abbreviations (agent output not abbreviated)")
+                    er_diagram_spec = self._generate_er_diagram_spec()
             
             # Normalize ER spec shape for UI consumption
             er_diagram_spec = self._normalize_er_spec(er_diagram_spec)
@@ -590,7 +697,9 @@ Sample Data: {df.head(2).to_dict('records')}
                 ddl_parts.append(f"CREATE TABLE {table_name} (")
                 
                 columns = []
+                table_abbrev = self.abbrev_map.get(table_name, {})
                 for col in df.columns:
+                    abbr_col = table_abbrev.get(col, col)
                     col_type = self._infer_sql_type(df[col])
                     
                     # Check if this is a primary key candidate
@@ -606,7 +715,7 @@ Sample Data: {df.head(2).to_dict('records')}
                     elif not pk_info.get('has_nulls', True):
                         constraint = " NOT NULL"
                     
-                    columns.append(f"    {col} {col_type}{constraint}")
+                    columns.append(f"    {abbr_col} {col_type}{constraint}")
                 
                 ddl_parts.append(",\n".join(columns))
                 ddl_parts.append(");\n")
@@ -632,12 +741,15 @@ Sample Data: {df.head(2).to_dict('records')}
                             child_col not in child_df.columns or
                             parent_col not in parent_df.columns):
                         continue
+                    # Map to abbreviated names
+                    child_abbr = self.abbrev_map.get(child_table, {}).get(child_col, child_col)
+                    parent_abbr = self.abbrev_map.get(parent_table, {}).get(parent_col, parent_col)
                     ddl_parts.append(
                         (
                             f"ALTER TABLE {child_table} ADD CONSTRAINT "
-                            f"fk_{child_table}_{child_col} "
-                            f"FOREIGN KEY ({child_col}) REFERENCES "
-                            f"{parent_table}({parent_col});"
+                            f"fk_{child_table}_{child_abbr} "
+                            f"FOREIGN KEY ({child_abbr}) REFERENCES "
+                            f"{parent_table}({parent_abbr});"
                         )
                     )
             
@@ -645,12 +757,14 @@ Sample Data: {df.head(2).to_dict('records')}
             ddl_parts.append("\n-- Performance Indexes")
             for table_name in self.dataframes.keys():
                 if self.dataframes[table_name] is not None:
+                    table_abbrev = self.abbrev_map.get(table_name, {})
                     for col in self.dataframes[table_name].columns:
-                        if col.endswith('_id') or 'id' in col.lower():
+                        abbr_col = table_abbrev.get(col, col)
+                        if abbr_col.endswith('_id') or 'id' in abbr_col.lower():
                             ddl_parts.append(
                                 (
-                                    f"CREATE INDEX idx_{table_name}_{col} "
-                                    f"ON {table_name}({col});"
+                                    f"CREATE INDEX idx_{table_name}_{abbr_col} "
+                                    f"ON {table_name}({abbr_col});"
                                 )
                             )
             
@@ -698,12 +812,14 @@ Sample Data: {df.head(2).to_dict('records')}
                     continue
                     
                 attributes = []
+                table_abbrev = self.abbrev_map.get(table_name, {})
                 for col in df.columns:
+                    abbr_col = table_abbrev.get(col, col)
                     pk_info = primary_keys.get(table_name, {}).get(col, {})
                     is_pk = pk_info.get('is_unique', False) and not pk_info.get('has_nulls', True)
                     
                     attributes.append({
-                        'name': col,
+                        'name': abbr_col,
                         'type': str(df[col].dtype),
                         'is_primary_key': is_pk,
                         'is_nullable': pk_info.get('has_nulls', True),
@@ -725,7 +841,8 @@ Sample Data: {df.head(2).to_dict('records')}
                 else:
                     continue
                 for relation in relations_list:
-                    fk_child = relation.get('child_column') or relation.get('column')
+                    fk_child_orig = relation.get('child_column') or relation.get('column')
+                    fk_child = self.abbrev_map.get(child_table, {}).get(fk_child_orig, fk_child_orig)
                     relationships_spec.append({
                         'parent_entity': parent_table,
                         'child_entity': child_table,

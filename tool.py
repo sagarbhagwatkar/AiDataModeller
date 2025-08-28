@@ -379,85 +379,155 @@ def create_erd_diagram(
 # (map_columns_to_abbreviations function removed)
 
 
-def abbreviate_columns(columns: Iterable[str], custom_rules: Optional[Dict[str, str]] = None,
-                       max_token_length: int = 12) -> Dict[str, str]:
-    """Create shortened/abbreviated variants of column names.
+def abbreviate_columns(
+    columns: Iterable[str],
+    custom_rules: Optional[Dict[str, str]] = None,
+    max_token_length: int = 12,
+    apply_suffixes: bool = True,
+) -> Dict[str, str]:
+    """Create shortened/abbreviated variants of column names with semantic suffixes.
 
-    Strategy:
-      1. Split each name into tokens on underscores, spaces, camelCase boundaries.
-      2. Apply rule-based replacements (e.g. name->nm, number->num, description->desc).
-      3. For long tokens not covered by a rule, drop interior vowels after the first letter
-         until token length <= 4 (simple heuristic) while preserving leading character sequence.
-      4. Rejoin with underscores.
-      5. Ensure uniqueness; if collision occurs, append numeric suffix (_2, _3, ...).
+    Steps:
+      1. Tokenize by underscores, non-alphanumerics, and camelCase boundaries -> lowercase tokens.
+      2. Apply rule-based token substitutions.
+      3. Compress long tokens by vowel removal (post-first letter) to <=4 chars if no rule.
+      4. Assemble snake_case name from abbreviated tokens.
+    5. Optionally append semantic clarity suffixes:
+         • Phone-like columns -> _no (phone number)
+         • Name / entity label columns (single entity like country, or containing 'name') -> _nm
+         • Email columns -> _id (email treated as natural identifier) e.g. EmailAddress -> eml_id
+         • Status columns -> _cd (status code) e.g. order_status -> order_sts_cd
+         • Percentage columns -> _pct when containing percentage / percent tokens
+         Skip suffix if column already ends with it or appears to be an id.
+      6. Enforce uniqueness by incrementing suffix (_2, _3, ...).
 
     Args:
-        columns: Original column names.
-        custom_rules: Optional dict overriding / extending built-in token rules.
-        max_token_length: Hard upper bound for any individual token (after abbreviation).
+        columns: Source column names.
+        custom_rules: Overrides / additions to base token rules.
+        max_token_length: Maximum length per token post-abbreviation.
+        apply_suffixes: Toggle semantic suffix addition.
 
     Returns:
-        Dict mapping original column name -> abbreviated column name.
+        Mapping original_name -> abbreviated_name.
     """
-    # Base rules (token -> abbreviation)
     rules: Dict[str, str] = {
-        'identifier': 'id', 'identity': 'id', 'id': 'id',
-        'number': 'num', 'nbr': 'num', 'count': 'cnt',
-        'name': 'nm', 'first': 'first', 'last': 'last',
-        'description': 'desc', 'status': 'sts', 'quantity': 'qty', 'amount': 'amt',
-        'date': 'dt', 'datetime': 'dt', 'timestamp': 'ts',
-        'price': 'prc', 'total': 'tot', 'average': 'avg', 'minimum': 'min', 'maximum': 'max',
+        # Identity / keys
+        'identifier': 'id', 'identity': 'id', 'id': 'id', 'key': 'key', 'sequence': 'seq',
+        # Numeric / measures
+        'number': 'num', 'nbr': 'num', 'count': 'cnt', 'total': 'tot', 'average': 'avg',
+        'minimum': 'min', 'maximum': 'max', 'amount': 'amt', 'quantity': 'qty', 'score': 'scr',
+        'rating': 'rtg', 'value': 'val', 'balance': 'bal', 'percent': 'pct', 'percentage': 'pct',
+        # Names / descriptive
+        'name': 'nm', 'description': 'desc', 'comment': 'cmt', 'remarks': 'rmk', 'remark': 'rmk',
+        'note': 'note', 'message': 'msg', 'status': 'sts', 'priority': 'prio', 'level': 'lvl',
+        # Temporal
+        'date': 'dt', 'datetime': 'dt', 'timestamp': 'ts', 'created': 'crt', 'updated': 'upd',
+        'modified': 'mod', 'start': 'start', 'end': 'end',
+        # Domain entities
         'customer': 'cust', 'employee': 'emp', 'department': 'dept', 'product': 'prod',
-        'address': 'addr', 'street': 'st', 'state': 'st', 'country': 'ctry', 'city': 'city',
-        'phone': 'ph', 'email': 'em', 'postal': 'pst', 'code': 'cd',
-        'category': 'cat', 'type': 'typ', 'version': 'ver', 'reference': 'ref',
-        'parent': 'prnt', 'child': 'chld'
+        'project': 'proj', 'organization': 'org', 'account': 'acct', 'transaction': 'txn',
+        'invoice': 'inv', 'supplier': 'sup', 'vendor': 'vend', 'purchase': 'purch', 'order': 'ord',
+        # Address / geo
+        'address': 'addr', 'street': 'st', 'state': 'st', 'country': 'cntry', 'city': 'city',
+        'zipcode': 'zip', 'zip': 'zip', 'postal': 'pst', 'location': 'loc', 'latitude': 'lat',
+        'longitude': 'lon', 'region': 'rgn', 'province': 'prov',
+        # Contact / comms
+        'phone': 'ph', 'mobile': 'mob', 'email': 'eml', 'url': 'url', 'ip': 'ip',
+        # Classification / codes
+        'code': 'cd', 'category': 'cat', 'type': 'typ', 'version': 'ver', 'reference': 'ref',
+        'statuscode': 'sts_cd',
+        # Parent/child
+        'parent': 'prnt', 'child': 'chld',
+        # Security / integrity
+        'hash': 'hash', 'checksum': 'chksum', 'signature': 'sig',
+        # Config / system
+        'config': 'cfg', 'configuration': 'cfg', 'setting': 'setg', 'policy': 'plcy', 'rule': 'rule',
+        'error': 'err', 'response': 'resp', 'request': 'req',
+        # Files / paths
+        'file': 'file', 'filename': 'fname', 'extension': 'ext', 'path': 'path', 'size': 'sz',
+        # Misc
+        'index': 'idx', 'position': 'pos', 'flag': 'flg', 'active': 'actv', 'inactive': 'inactv',
+        'enabled': 'enbl', 'disabled': 'dsbl', 'currency': 'ccy'
     }
     if custom_rules:
-        # Custom rules override defaults
         for k, v in custom_rules.items():
             rules[k.lower()] = v
 
+    PHONE_TOKENS = {
+        'phone', 'telephone', 'tel', 'mobile', 'mob', 'cell', 'cellphone', 'mobilephone'
+    }
+    EMAIL_TOKENS = {'email', 'emailaddress', 'e_mail', 'mail'}
+    NAME_ENTITY_TOKENS = {'country', 'city', 'state', 'province', 'region'}
+    STATUS_TOKENS = {'status'}
+    PERCENT_TOKENS = {'percent', 'percentage'}
+
     def split_tokens(name: str) -> List[str]:
-        # Replace non-alphanum with underscore
         cleaned = re.sub(r'[^0-9A-Za-z]+', '_', name)
-        # Insert underscore before camelCase transitions
         cleaned = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', cleaned)
-        tokens = [t for t in cleaned.lower().split('_') if t]
-        return tokens or ['col']
+        toks = [t for t in cleaned.lower().split('_') if t]
+        return toks or ['col']
 
     def abbreviate_token(tok: str) -> str:
         if tok in rules:
             return rules[tok]
-        # Already short enough
         if len(tok) <= 4:
             return tok
-        # Remove interior vowels after first letter until length <=4
-        head = tok[0]
-        tail = tok[1:]
+        head, tail = tok[0], tok[1:]
         tail_no_vowels = re.sub(r'[aeiou]', '', tail)
         candidate = (head + tail_no_vowels)[:4]
-        if len(candidate) < 2:  # fallback to first 4 chars
+        if len(candidate) < 2:
             candidate = tok[:4]
         return candidate
 
     abbrev_map: Dict[str, str] = {}
     used: Dict[str, int] = {}
+
     for original in columns:
         tokens = split_tokens(original)
         short_tokens = [abbreviate_token(t)[:max_token_length] for t in tokens]
         short_name = '_'.join(short_tokens)
-        # Enforce max length for full name (arbitrary 30 chars)
+
+        if apply_suffixes:
+            has_id = any(t == 'id' or t.endswith('id') for t in tokens) or short_name.endswith('_id')
+            token_set = set(tokens)
+            lower_original = original.lower()
+            # Email rule (precedence)
+            is_email = any(t in EMAIL_TOKENS for t in token_set) or 'email' in lower_original
+            if is_email and not has_id and not short_name.endswith('_id'):
+                short_name += '_id'
+            else:
+                # Phone rule
+                is_phone = any(t in PHONE_TOKENS for t in token_set) or 'phone' in lower_original
+                if is_phone and not has_id and not short_name.endswith('_no'):
+                    if not re.search(r'(?:_|^)no$', short_name):
+                        short_name = re.sub(r'_num$', '', short_name)
+                        short_name += '_no'
+                else:
+                    # Name rule
+                    contains_name_token = 'name' in token_set or any(tok.endswith('name') for tok in token_set)
+                    single_entity = len(token_set) == 1 and next(iter(token_set)) in NAME_ENTITY_TOKENS
+                    if (contains_name_token or single_entity) and not has_id and not short_name.endswith('_nm'):
+                        short_name += '_nm'
+            # Status rule
+            is_status = any(t in STATUS_TOKENS for t in token_set) or 'status' in lower_original
+            if is_status and not short_name.endswith('_cd'):
+                short_name += '_cd'
+            # Percentage rule
+            is_percent = any(t in PERCENT_TOKENS for t in token_set)
+            if is_percent and not short_name.endswith('_pct') and 'pct' not in short_name.split('_')[-1]:
+                short_name += '_pct'
+
         if len(short_name) > 30:
-            parts = []
+            parts: List[str] = []
             current_len = 0
             for st in short_tokens:
-                if current_len + len(st) + (1 if parts else 0) > 30:
+                next_len = current_len + len(st) + (1 if parts else 0)
+                if next_len > 30:
                     break
                 parts.append(st)
-                current_len += len(st) + (1 if parts else 0)
+                current_len = next_len
             short_name = '_'.join(parts)
-        # Uniqueness enforcement
+
         base = short_name
         if base in used:
             used[base] += 1
