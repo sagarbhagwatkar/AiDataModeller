@@ -38,79 +38,138 @@ def csvs_to_dataframes(uploaded_files) -> Dict[str, pd.DataFrame]:
 def csvs_jsons_to_dataframes(uploaded_files) -> Dict[str, pd.DataFrame]:
     """Load multiple uploaded CSV, JSON (nested), or Excel (xlsx/xls) files into DataFrames.
 
-    Enhanced JSON handling (non-breaking):
-      * Previous simple behavior retained for simple list[dict] or dict with single list.
-      * NEW: Recursively extract every list of objects (list[dict]) found anywhere in the JSON tree.
-      * Each extracted table gets a generated name: ``<base>__<path_segments_joined>``.
-      * Parent/child relationships preserved via surrogate integer primary keys:
-           - Each table gets ``__row_id`` (surrogate PK)
-           - Child tables get ``__parent_id`` referencing the parent's ``__row_id``
-      * Nested objects (dicts) are flattened into parent row columns with dot-path names.
-      * Lists of primitives are ignored (can be added later if needed).
-
-    Args:
-        uploaded_files: Iterable of file-like objects with a ``name`` attribute.
-
-    Returns:
-        Dictionary mapping table name to DataFrame. For simple JSON there will still
-        be a single table named after the file (backward compatible). For nested JSON
-        multiple tables may be returned.
+    Updated JSON extraction rules (generic, no hardcoded examples):
+      * One row in the top-level array/object = one entity row in the parent table.
+      * Nested object fields are flattened into the parent row (recursive) using underscore-separated paths.
+      * Each nested list creates a new child table named ``<base>__<path_segments_joined>``.
+      * Child tables always include the parent's natural key column value as a foreign key.
+      * Natural key detection: choose the first column that is (a) named 'id' or ends with '_id' (case-insensitive) and is unique/non-null across rows; else any unique non-null column; else generate synthetic key ``<base>_pk``.
+      * Lists of primitives or mixed types also become child tables with columns: parent_key, value/raw_value, idx, and optional type_hint.
+      * Lists inside list-of-dicts are recursively processed creating deeper child tables that still reference the root natural key.
     """
 
-    def _extract_tables(obj: Any, base_name: str, path: List[str], parent_id: int | None,
-                        tables: Dict[str, List[Dict[str, Any]]], parent_table: str | None,
-                        table_meta: Dict[str, Dict[str, Any]]):
-        """Recursive walk collecting list[dict] structures as separate tables.
+    def _snake(name: str) -> str:
+        name = re.sub(r'[^0-9A-Za-z]+', '_', name)
+        name = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', name)
+        return re.sub(r'_+', '_', name).strip('_').lower()
 
-        Args:
-            obj: Current JSON node.
-            base_name: Root file base name.
-            path: Accumulated path segments.
-            parent_id: Surrogate id of parent row if inside a list element.
-            tables: Accumulator mapping table_name -> list of row dicts.
-            parent_table: Name of parent table.
-            table_meta: Metadata store for relationships.
+    def _flatten(
+        obj: Dict[str, Any],
+        out: Dict[str, Any],
+        prefix: Optional[List[str]],
+        base_name: str,
+        parent_key_name: str,
+        parent_key_val: Any,
+        tables: Dict[str, List[Dict[str, Any]]],
+    ):
+        """Flatten nested object into the parent row.
+
+        Additionally, if a nested list is encountered within the object, create
+        a child table for that list (path-driven) and propagate the parent's
+        natural key.
         """
-        if isinstance(obj, list):
-            if all(isinstance(el, dict) for el in obj) and obj:
-                # This list becomes/augments a table
-                table_name = base_name if not path else f"{base_name}__{'__'.join(path)}"
-                if table_name not in tables:
-                    tables[table_name] = []
-                    table_meta[table_name] = {"parent_table": parent_table}
-                for idx, row in enumerate(obj):
-                    if not isinstance(row, dict):  # safety
-                        continue
-                    flat_row: Dict[str, Any] = {}
-                    # Flatten nested object fields first (will recurse for deeper lists)
-                    for k, v in row.items():
-                        if isinstance(v, (dict, list)):
-                            # Defer to recursion for lists, flatten dicts later
-                            continue
-                        flat_row[k] = v
-                    flat_row['__row_id'] = len(tables[table_name]) + 1
-                    if parent_id is not None:
-                        flat_row['__parent_id'] = parent_id
-                    tables[table_name].append(flat_row)
-                    # Recurse into nested dicts to append flattened keys to the same row
-                    for k, v in row.items():
-                        if isinstance(v, dict):
-                            for dk, dv in v.items():
-                                col_name = f"{k}.{dk}"
-                                tables[table_name][-1][col_name] = dv
-                        elif isinstance(v, list):
-                            # Child list -> separate child table
-                            _extract_tables(v, base_name, path + [k], tables[table_name][-1]['__row_id'],
-                                            tables, table_name, table_meta)
+        prefix = prefix or []
+        for k, v in obj.items():
+            key_path = prefix + [k]
+            if isinstance(v, dict):
+                _flatten(v, out, key_path, base_name, parent_key_name, parent_key_val, tables)
+            elif isinstance(v, list):
+                # Extract list inside object as its own table
+                _process_list(
+                    v,
+                    base_name,
+                    key_path,  # full hierarchical path
+                    parent_key_name,
+                    parent_key_val,
+                    tables,
+                )
             else:
-                # List of primitives or empty: ignore for now
-                return
-        elif isinstance(obj, dict):
-            # Explore dict values
-            for k, v in obj.items():
-                _extract_tables(v, base_name, path + [k], parent_id, tables, parent_table, table_meta)
-        else:
+                out[_snake('_'.join(key_path))] = v
+
+    def _detect_natural_key(rows: List[Dict[str, Any]], base: str) -> str:
+        if not rows:
+            return f"{base}_pk"
+        candidates_ordered: List[str] = []
+        # First pass: id heuristics
+        for k in rows[0].keys():
+            lk = k.lower()
+            if lk == 'id' or lk.endswith('_id'):
+                candidates_ordered.append(k)
+        # Second pass: any column
+        for k in rows[0].keys():
+            if k not in candidates_ordered:
+                candidates_ordered.append(k)
+        for cand in candidates_ordered:
+            try:
+                vals = [r.get(cand) for r in rows]
+                if any(v is None for v in vals):
+                    continue
+                if len(set(vals)) == len(rows):
+                    return cand
+            except Exception:
+                continue
+        return f"{base}_pk"
+
+    def _process_list(
+        lst: List[Any],
+        base_name: str,
+        path: List[str],
+        parent_key_name: str,
+        parent_key_val: Any,
+        tables: Dict[str, List[Dict[str, Any]]],
+    ):
+        if not lst:
             return
+        # Build table name with single underscores only: base_segment1_segment2
+        if path:
+            table_name = base_name + '_' + '_'.join(_snake(p) for p in path)
+        else:
+            table_name = base_name
+        table_name = re.sub(r'_+', '_', table_name)  # collapse duplicates
+        out_rows = tables.setdefault(table_name, [])
+        all_dicts = all(isinstance(el, dict) for el in lst)
+        all_prims = all(not isinstance(el, (dict, list)) for el in lst)
+        for idx, item in enumerate(lst, start=1):
+            if all_dicts and isinstance(item, dict):
+                flat_row: Dict[str, Any] = {parent_key_name: parent_key_val, 'idx': idx}
+                has_scalar = False
+                for k, v in item.items():
+                    if isinstance(v, dict):
+                        _flatten(v, flat_row, [k], base_name, parent_key_name, parent_key_val, tables)
+                    elif isinstance(v, list):
+                        _process_list(v, base_name, path + [k], parent_key_name, parent_key_val, tables)
+                    else:
+                        flat_row[_snake(k)] = v
+                        has_scalar = True
+                # Always add the row even if only nested lists (helps preserve positional idx)
+                if not has_scalar:
+                    flat_row['has_children'] = True
+                out_rows.append(flat_row)
+            elif all_prims:
+                out_rows.append({parent_key_name: parent_key_val, 'idx': idx, 'value': item})
+            else:
+                # Mixed content list (contains both primitives and objects)
+                if isinstance(item, dict):
+                    flat_row: Dict[str, Any] = {parent_key_name: parent_key_val, 'idx': idx}
+                    has_scalar = False
+                    for k, v in item.items():
+                        if isinstance(v, dict):
+                            _flatten(v, flat_row, [k], base_name, parent_key_name, parent_key_val, tables)
+                        elif isinstance(v, list):
+                            _process_list(v, base_name, path + [k], parent_key_name, parent_key_val, tables)
+                        else:
+                            flat_row[_snake(k)] = v
+                            has_scalar = True
+                    if not has_scalar:
+                        flat_row['has_children'] = True
+                    out_rows.append(flat_row)
+                elif isinstance(item, list):
+                    # Nested list inside mixed scenario; recurse and add a marker row
+                    _process_list(item, base_name, path + ['nested'], parent_key_name, parent_key_val, tables)
+                    out_rows.append({parent_key_name: parent_key_val, 'idx': idx, 'has_children': True})
+                else:
+                    # Primitive within mixed list
+                    out_rows.append({parent_key_name: parent_key_val, 'idx': idx, 'value': item})
 
     dataframes: Dict[str, pd.DataFrame] = {}
     for uploaded_file in uploaded_files:
@@ -137,27 +196,53 @@ def csvs_jsons_to_dataframes(uploaded_files) -> Dict[str, pd.DataFrame]:
                 raise ValueError('Unsupported file type. Only CSV, JSON, and Excel are allowed.')
 
             raw_json = json.load(uploaded_file)
+            # Normalize top-level to list of dict rows
+            if isinstance(raw_json, list):
+                top_rows = [r for r in raw_json if isinstance(r, dict)]
+            elif isinstance(raw_json, dict):
+                top_rows = [raw_json]
+            else:
+                raise ValueError('Top-level JSON must be object or list of objects.')
+            if not top_rows:
+                raise ValueError('No valid objects found in JSON.')
 
-            # Use recursive extraction
-            tables: Dict[str, List[Dict[str, Any]]] = {}
-            table_meta: Dict[str, Dict[str, Any]] = {}
-            _extract_tables(raw_json, base_name, [], None, tables, None, table_meta)
+            parent_key_name = _detect_natural_key(top_rows, base_name)
+            synthetic = parent_key_name == f"{base_name}_pk"
+            base_rows: List[Dict[str, Any]] = []
+            tables_accum: Dict[str, List[Dict[str, Any]]] = {}
 
-            if not tables:
-                # Fallback to simple normalization
-                if isinstance(raw_json, list) and raw_json and isinstance(raw_json[0], dict):
-                    tables[base_name] = [row for row in raw_json if isinstance(row, dict)]
-                elif isinstance(raw_json, dict):
-                    tables[base_name] = [raw_json]
-                else:
-                    raise ValueError('Unsupported JSON structure for normalization.')
+            for seq, row in enumerate(top_rows, start=1):
+                parent_key_val = row.get(parent_key_name) if not synthetic else seq
+                base_row: Dict[str, Any] = {}
+                if synthetic:
+                    base_row[parent_key_name] = parent_key_val
+                # Ensure natural key carried if not synthetic
+                elif parent_key_name in row:
+                    base_row[parent_key_name] = parent_key_val
+                # Process fields
+                for k, v in row.items():
+                    if isinstance(v, dict):
+                        _flatten(
+                            v,
+                            base_row,
+                            [k],
+                            base_name,
+                            parent_key_name,
+                            parent_key_val,
+                            tables_accum,
+                        )
+                    elif isinstance(v, list):
+                        _process_list(v, base_name, [k], parent_key_name, parent_key_val, tables_accum)
+                    else:
+                        if k == parent_key_name and not synthetic:
+                            continue  # already set
+                        base_row[_snake(k)] = v
+                base_rows.append(base_row)
 
-            # Convert collected rows to DataFrames
-            for tname, rows in tables.items():
-                df = pd.json_normalize(rows)
-                if df.empty or df.shape[1] == 0:
-                    continue
-                dataframes[tname] = df
+            dataframes[base_name] = pd.DataFrame(base_rows)
+            for tname, rows in tables_accum.items():
+                if rows:
+                    dataframes[tname] = pd.DataFrame(rows)
         except Exception as e:  # noqa: BLE001
             print(f"Error reading {uploaded_file.name}: {e}")
             dataframes[base_name] = None
@@ -537,6 +622,114 @@ def abbreviate_columns(
         abbrev_map[original] = short_name
 
     return abbrev_map
+
+
+def abbreviate_table_names(
+    table_names: Iterable[str],
+    *,
+    max_token_length: int = 10,
+    max_total_length: int = 32,
+    max_tokens: int = 4,
+    prefer_readable: bool = True,
+) -> Dict[str, str]:
+    """Simplified table name abbreviation.
+
+    For each table name:
+      * Split into tokens (underscore / non-alnum / camelCase)
+      * If a token (singularized) exists in the dictionary, use its abbreviation
+      * Otherwise, keep the original token unchanged
+      * Preserve overall case style: all lowercase input -> lowercase output, else UPPERCASE tokens
+      * Join tokens with underscore; ensure uniqueness by appending numeric suffixes when required
+
+    Only the dictionary mapping influences abbreviations; no compression, truncation,
+    or token count limiting is applied. Unmapped tokens remain exactly as they appeared (case normalized).
+    """
+
+    token_map: Dict[str, str] = {
+        'employee': 'EMPL', 'emp': 'EMPL', 'customer': 'CUST', 'cust': 'CUST', 'client': 'CLNT',
+        'supplier': 'SUP', 'vendor': 'VEND', 'organization': 'ORG', 'department': 'DEPT',
+        'project': 'PROJ', 'product': 'PROD', 'account': 'ACCT', 'user': 'USR', 'student': 'STUD',
+        'course': 'CRS', 'warehouse': 'WH', 'inventory': 'INV', 'order': 'ORD', 'invoice': 'INV',
+        'assignment': 'ASGN', 'enrollment': 'ENRL', 'phone': 'PH', 'email': 'EML', 'address': 'ADDR',
+        'hierarchy': 'HIER', 'category': 'CAT', 'type': 'TYP', 'status': 'STS', 'state': 'ST',
+        'country': 'CNTRY', 'region': 'RGN', 'province': 'PROV', 'city': 'CITY', 'location': 'LOC',
+        'code': 'CD', 'identifier': 'ID', 'id': 'ID', 'number': 'NUM', 'sequence': 'SEQ', 'index': 'IDX',
+        'date': 'DT', 'datetime': 'DT', 'timestamp': 'TS', 'created': 'CRT', 'updated': 'UPD',
+        'description': 'DESC', 'comment': 'CMT', 'remarks': 'RMK', 'remark': 'RMK', 'name': 'NM',
+        'amount': 'AMT', 'total': 'TOT', 'quantity': 'QTY', 'average': 'AVG', 'minimum': 'MIN',
+        'maximum': 'MAX', 'balance': 'BAL', 'percent': 'PCT', 'percentage': 'PCT', 'value': 'VAL',
+        'phonebook': 'PHBK', 'profile': 'PRFL', 'configuration': 'CFG', 'setting': 'SETG', 'policy': 'PLCY',
+        'reference': 'REF', 'version': 'VER', 'message': 'MSG', 'log': 'LOG', 'history': 'HIST', 'detail': 'DTL',
+        'details': 'DTL', 'record': 'REC', 'records': 'REC'
+    }
+
+    camel_split = re.compile(r'(?<!^)(?=[A-Z])')
+
+    def tokenize(name: str) -> List[str]:
+        parts = re.split(r'[_\W]+', name)
+        tokens: List[str] = []
+        for p in parts:
+            if not p:
+                continue
+            for s in camel_split.split(p):
+                if s:
+                    tokens.append(s)
+        return tokens or [name]
+
+    def singularize(tok: str) -> str:
+        low = tok.lower()
+        # Common plural -> singular patterns using token_map awareness (generic, no hardcoded examples)
+        if len(low) > 3 and low.endswith('ies'):
+            # companies -> company
+            candidate = low[:-3] + 'y'
+            return candidate
+        # Handle words ending in 'ses' (classes -> class) when base in dictionary
+        if len(low) > 4 and low.endswith('ses') and low[:-2] in token_map:
+            return low[:-2]
+        # Generic 'es' ending: decide whether to drop 'es' or just 's' based on dictionary presence
+        if len(low) > 3 and low.endswith('es'):
+            drop_es = low[:-2]      # phones -> phon, classes -> class
+            drop_s = low[:-1]       # phones -> phone
+            # Prefer form present in dictionary
+            if drop_es in token_map and drop_s not in token_map:
+                return drop_es
+            if drop_s in token_map:
+                return drop_s
+            # Fallback heuristic: if drop_s + 's' == original, prefer drop_s (avoids phon)
+            if drop_s + 's' == low:
+                return drop_s
+            return drop_es
+        # Simple trailing 's'
+        if len(low) > 3 and low.endswith('s'):
+            base = low[:-1]
+            return base if base else low
+        return low
+
+    used: Dict[str, int] = {}
+    output: Dict[str, str] = {}
+
+    for original in table_names:
+        case_lower = original.islower()
+        tokens = tokenize(original)
+        mapped: List[str] = []
+        for t in tokens:
+            base = singularize(t)
+            abbr = token_map.get(base)
+            if abbr:
+                mapped.append(abbr.lower() if case_lower else abbr)
+            else:
+                # keep original token, normalize case style
+                mapped.append(t.lower() if case_lower else t.upper())
+        candidate = '_'.join(mapped)
+        base_candidate = candidate
+        if base_candidate in used:
+            used[base_candidate] += 1
+            candidate = f"{base_candidate}_{used[base_candidate]}"
+        else:
+            used[base_candidate] = 1
+        output[original] = candidate
+
+    return output
 
 
 
